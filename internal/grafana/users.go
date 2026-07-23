@@ -8,8 +8,9 @@ import (
 	"log/slog"
 	"math/big"
 	"slices"
+	"strings"
+	"sync"
 
-	"github.com/grafana/grafana-openapi-client-go/client/users"
 	"github.com/grafana/grafana-openapi-client-go/models"
 	"github.com/skuethe/grafana-oss-team-sync/internal/config"
 	"github.com/skuethe/grafana-oss-team-sync/internal/config/configtypes"
@@ -18,6 +19,12 @@ import (
 type User models.AdminCreateUserForm
 
 type Users []User
+
+var (
+	existingUsersOnce sync.Once
+	existingUsers     map[string]struct{}
+	existingUsersErr  error
+)
 
 func generateSecurePassword() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+"
@@ -33,17 +40,59 @@ func generateSecurePassword() string {
 	return string(password)
 }
 
-func (u *User) searchUser() (*users.GetUserByLoginOrEmailOK, error) {
-	result, err := Instance.api.Users.GetUserByLoginOrEmail(u.Login)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+// loadExistingUsers fetches every user of the current Grafana organisation
+// once and caches them, keyed by lower-cased email and login.
+//
+// We deliberately use the org-scoped endpoint (GET /api/org/users) instead of
+// the global lookup (GET /api/users/lookup): the latter requires server-admin
+// (global users:read) permissions, which an org-Admin service-account token
+// does not have, so with token auth it always returns 403 and every existence
+// check fails.
+func loadExistingUsers() (map[string]struct{}, error) {
+	existingUsersOnce.Do(func() {
+		set := make(map[string]struct{})
+		resp, err := Instance.api.Org.GetOrgUsersForCurrentOrg(nil)
+		if err != nil {
+			existingUsersErr = err
+			return
+		}
+		for _, orgUser := range resp.Payload {
+			if orgUser.Email != "" {
+				set[strings.ToLower(orgUser.Email)] = struct{}{}
+			}
+			if orgUser.Login != "" {
+				set[strings.ToLower(orgUser.Login)] = struct{}{}
+			}
+		}
+		existingUsers = set
+	})
+	return existingUsers, existingUsersErr
 }
 
 func (u *User) doesUserExist() bool {
-	_, err := u.searchUser()
-	return err == nil
+	set, err := loadExistingUsers()
+	if err != nil {
+		slog.Error("could not load existing org users for existence check",
+			slog.Any("error", err),
+		)
+		return false
+	}
+	// Match by email first: with Entra ID B2B guest accounts the
+	// userPrincipalName (Login) is the mangled guest form
+	// (user_domain.tld#EXT#@tenant.onmicrosoft.com) which never matches the
+	// existing Grafana user, whereas the mail attribute does. Fall back to
+	// login when no email is available.
+	if u.Email != "" {
+		if _, ok := set[strings.ToLower(u.Email)]; ok {
+			return true
+		}
+	}
+	if u.Login != "" {
+		if _, ok := set[strings.ToLower(u.Login)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (u *User) createUser() error {
